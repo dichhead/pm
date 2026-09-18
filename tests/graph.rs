@@ -12,12 +12,13 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use pm::bf::{BuildFile, BuildOptions};
+use pm::context::BuildContext;
 use pm::graph::Graph;
 use pm::progress::Progress;
 use tempfile::{TempDir, tempdir};
 
 mod common;
-use common::{CwdGuard, build_file_yaml, write_build_file};
+use common::{build_file_yaml, write_build_file};
 
 /// Writes a build file named `name` at `<dir>/<name>.yaml` depending on `deps`.
 fn package(dir: &TempDir, name: &str, deps: &[&Path]) -> PathBuf {
@@ -191,8 +192,10 @@ fn a_build_file_whose_commands_cannot_be_classified_is_rejected() {
 
 // --- Building the resolved graph -------------------------------------------
 //
-// These run real builds, so they are slower than the resolution tests above
-// and they move the process-wide current directory under `CwdGuard`.
+// These run real builds, so they are slower than the resolution tests above.
+// Each points its own `BuildContext` at its own temporary directory rather
+// than moving the process-wide current directory, so they need no lock to run
+// alongside each other.
 
 /// A step that sleeps `seconds` and then stamps a file into `DESTDIR`.
 ///
@@ -231,32 +234,36 @@ fn failing_package(dir: &TempDir, name: &str, deps: &[&Path]) -> PathBuf {
     )
 }
 
-/// Resolves and builds `root` from inside `at`, with `jobs` workers.
+/// Resolves and builds `root`, with its dependencies resolved against `at` and
+/// every archive it produces landing there, using `jobs` workers.
 fn build_at(root: &Path, at: &Path, jobs: usize) -> miette::Result<PathBuf> {
     timed_build_at(root, at, jobs).0
 }
 
 /// As [`build_at`], also reporting how long the build itself took.
 ///
-/// The clock starts **after** the current-directory lock has been taken. Tests
-/// in one binary run as threads and every build here serialises on that lock,
-/// so a clock started any earlier would be measuring how long a sibling test
-/// held it - which is how a timing assertion turns into a flake that gets worse
-/// every time another test is added.
+/// The clock starts after resolution, timing only [`Graph::build_in`] itself.
+/// Nothing here moves the process's current directory - each call gets its own
+/// [`BuildContext`] pointed at `at` - so, unlike when this test suite serialised
+/// concurrent builds on a shared cwd, one test's timing is never inflated by a
+/// sibling test's build running at the same time.
 fn timed_build_at(root: &Path, at: &Path, jobs: usize) -> (miette::Result<PathBuf>, Duration) {
     let options = BuildOptions {
         jobs: NonZeroUsize::new(jobs),
         ..BuildOptions::default()
     };
     let build = BuildFile::load_unverified(root).expect("the root build file must load");
-    let graph = match Graph::resolve(&build, options) {
+    let ctx = BuildContext::from_env()
+        .expect("capture the ambient build context")
+        .with_cwd(at.to_path_buf())
+        .with_output_dir(at.to_path_buf());
+    let graph = match Graph::resolve_in(&ctx, &build, options) {
         Ok(graph) => graph,
         Err(report) => return (Err(report), Duration::ZERO),
     };
 
-    let _cwd = CwdGuard::enter(at);
     let started = Instant::now();
-    let result = graph.build(options, &Progress::disabled());
+    let result = graph.build_in(&ctx, options, &Progress::disabled());
     (result, started.elapsed())
 }
 

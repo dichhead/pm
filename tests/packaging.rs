@@ -1,11 +1,12 @@
 //! End-to-end packaging tests: run a real build and inspect the archive it
 //! leaves behind.
 //!
-//! `BuildFile::run()` writes its archive into the *process-wide* current
-//! directory, and Rust runs tests as threads inside a single process, so every
-//! test here moves the current directory under a lock and puts it back again.
+//! Every test here points a [`BuildContext`] at its own private directory
+//! instead of moving the process-wide current directory: the whole crate is
+//! built from having stopped `BuildFile` read that directory on its own, and a
+//! test that still chdir'd to prove it would only be proving the process cwd
+//! works, not that a caller-supplied one does.
 
-use std::env::current_dir;
 use std::fs::{read, read_to_string, write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -14,13 +15,21 @@ use std::thread::spawn;
 use std::time::Duration;
 
 use pm::bf::{BuildFile, BuildOptions};
+use pm::context::BuildContext;
 use pm::metadata::{LibraryType, Metadata, Type};
 use pm::progress::Progress;
 use serde_yaml::from_str;
 use tempfile::{TempDir, tempdir};
 
 mod common;
-use common::{CwdGuard, build_file_yaml, write_build_file};
+use common::{build_file_yaml, write_build_file};
+
+/// A [`BuildContext`] that writes its finished archive into `dir`.
+fn ctx_at(dir: &Path) -> BuildContext {
+    BuildContext::from_env()
+        .expect("capture the ambient build context")
+        .with_output_dir(dir.to_path_buf())
+}
 
 /// Stages a binary and two libraries into `DESTDIR`.
 ///
@@ -38,18 +47,14 @@ chmod 755 \"$DESTDIR/usr/bin/mytool\"\n\
 printf 'stand-in for a shared object\\n' > \"$DESTDIR/usr/lib/libfoo.so\"\n\
 printf 'stand-in for an archive\\n' > \"$DESTDIR/usr/lib/libbar.a\"\n";
 
-/// Runs `build` with the current directory moved to `at`, returning an absolute
-/// path to whatever archive it produced.
+/// Runs `build` with its archive directed at `at`, returning the absolute path
+/// it produced. `at` is always an absolute `TempDir` path, so the result
+/// already is too - unlike the process cwd this used to move to, there is no
+/// relative result to resolve.
 fn run_in(build: &BuildFile, at: &Path) -> PathBuf {
-    let _cwd = CwdGuard::enter(at);
-    let produced = build.run().expect("the build must succeed");
-    // Resolve relative results while the current directory is still the one
-    // `run()` wrote into.
-    if produced.is_absolute() {
-        produced
-    } else {
-        current_dir().expect("a current directory").join(produced)
-    }
+    build
+        .run_with_progress_in(&ctx_at(at), BuildOptions::default(), &Progress::disabled())
+        .expect("the build must succeed")
 }
 
 /// A finished build: the archive, the directory it was extracted into, and the
@@ -268,9 +273,14 @@ fn a_build_whose_step_fails_does_not_leave_an_archive_behind() {
     .expect("write the build file");
     let build = BuildFile::load_unverified(&build_file).expect("load");
 
-    let _cwd = CwdGuard::enter(work.path());
     assert!(
-        build.run().is_err(),
+        build
+            .run_with_progress_in(
+                &ctx_at(work.path()),
+                BuildOptions::default(),
+                &Progress::disabled()
+            )
+            .is_err(),
         "a failing build step must fail the build"
     );
     assert!(
@@ -330,9 +340,12 @@ fn a_dependency_that_does_not_exist_fails_the_build_and_names_the_path() {
 
     let build = BuildFile::load_unverified(&build_file).expect("load");
 
-    let _cwd = CwdGuard::enter(work.path());
     let error = build
-        .run()
+        .run_with_progress_in(
+            &ctx_at(work.path()),
+            BuildOptions::default(),
+            &Progress::disabled(),
+        )
         .expect_err("a dependency that is not on disk must fail the build");
 
     let rendered = format!("{error}\n{error:?}");
@@ -441,15 +454,17 @@ fn a_dependency_cycle_is_rejected_rather_than_recursing_forever() {
         &build_file_yaml("cycleb", &["0"], &[&first], &[]),
     );
 
-    let _cwd = CwdGuard::enter(work.path());
+    let ctx = ctx_at(work.path());
 
     // A regression here is an infinite recursion, which would hang the whole
     // suite. Run the build on its own thread and give up waiting on it rather
-    // than letting it wedge every other test behind the current-directory lock.
+    // than letting it wedge the test binary.
     let (tx, rx) = channel();
     spawn(move || {
         let outcome = BuildFile::load_unverified(&first)
-            .and_then(|build| build.run())
+            .and_then(|build| {
+                build.run_with_progress_in(&ctx, BuildOptions::default(), &Progress::disabled())
+            })
             .map(|archive| archive.display().to_string())
             .map_err(|error| format!("{error}\n{error:?}"));
         // The receiver is gone if the test already gave up; that is not a failure.
@@ -566,17 +581,9 @@ fn a_build_reporting_into_a_region_still_produces_its_archive() {
     // streamed into that line, and the archive at the end of it.
     let progress = Progress::to_writer(Box::new(std::io::sink()), 100);
 
-    let archive = {
-        let _cwd = CwdGuard::enter(work.path());
-        let produced = build
-            .run_with_progress(BuildOptions::default(), &progress)
-            .expect("the build must succeed with a region attached");
-        if produced.is_absolute() {
-            produced
-        } else {
-            current_dir().expect("a current directory").join(produced)
-        }
-    };
+    let archive = build
+        .run_with_progress_in(&ctx_at(work.path()), BuildOptions::default(), &progress)
+        .expect("the build must succeed with a region attached");
 
     assert!(
         archive.is_file(),

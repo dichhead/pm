@@ -44,6 +44,9 @@
 
 use std::{path::PathBuf, time::Duration};
 
+use nix::errno::Errno;
+use serde::Serialize;
+
 use crate::perms::{Permission, Permissions, Provenance};
 
 /// How to run the program being traced.
@@ -82,7 +85,14 @@ impl Default for TraceOptions {
 /// A single syscall can yield more than one observation (`rename` names two paths,
 /// `execve` implies both [`Permission::Spawn`] and [`Permission::ExecPath`]), so
 /// observations are per-permission rather than per-syscall.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// Only [`Serialize`] is derived here, not `Deserialize`: `syscall` is `&'static str`,
+/// interned in the `x86_64` module's private `TABLE`, and there is no lookup yet that
+/// turns a deserialised owned string back into one of those statics. `pm-trace` (the
+/// only thing writing this out today) only ever serialises a report, never reads one
+/// back, so a `Deserialize` impl - and the `TABLE` lookup it needs - is left for
+/// whichever future caller does, most likely a daemon reading `pm-trace`'s report file.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct Observation {
     pid: i32,
     syscall: &'static str,
@@ -154,7 +164,9 @@ impl Observation {
 /// for the unfolded detail behind it. Always check [`TraceReport::timed_out`]: a report
 /// from a run that was killed describes a prefix of the program's behaviour, so it is
 /// even less complete than a monitor report normally is.
-#[derive(Debug, Clone)]
+///
+/// Derives [`Serialize`] only, for the same reason [`Observation`] does - see its doc.
+#[derive(Debug, Clone, Serialize)]
 pub struct TraceReport {
     permissions: Permissions,
     observations: Vec<Observation>,
@@ -182,6 +194,105 @@ impl TraceReport {
     /// or never got far enough to exit.
     pub fn exit_status(&self) -> Option<i32> {
         self.exit_status
+    }
+}
+
+/// Why the traced child never reached its `execve`.
+///
+/// [`trace`]'s forked child has exactly four ways to die before the tracee's image is
+/// replaced - see `child` in the x86_64 implementation - and every one of them used to
+/// `_exit(127)` indistinguishably from a program that ran and genuinely exited 127 on its
+/// own. That collapsed "ptrace was denied" and "the binary does not exist" into the same
+/// empty, successful-looking [`TraceReport`]. This names which of the four it was and
+/// carries the syscall's own `errno`.
+///
+/// [`ChildFailure::Traceme`] is the one worth a [`miette::Diagnostic::help`]: a hardened
+/// kernel's `/proc/sys/kernel/yama/ptrace_scope` or an LSM policy can refuse it outright,
+/// and that describes the *host*, not the package, so it is the one thing here a caller
+/// can actually go fix.
+#[derive(Debug, Clone, Copy)]
+pub enum ChildFailure {
+    /// `setpgid` into a fresh process group failed.
+    SetPgid(Errno),
+    /// `chdir` into [`TraceOptions::working_dir`] failed - most often because it does not
+    /// exist.
+    Chdir(Errno),
+    /// `ptrace::traceme()` was refused. See [`ChildFailure`]'s docs for what to check.
+    Traceme(Errno),
+    /// `execve` failed: a missing or non-executable program.
+    Execve(Errno),
+}
+
+impl ChildFailure {
+    /// What a user can do about a denied `ptrace`: the two levers a hardened host
+    /// restricts it with. Shared with `preflight`'s own denial - the two mean exactly the
+    /// same thing.
+    const PTRACE_DENIED_HELP: &'static str = "ptrace was denied. Check \
+        /proc/sys/kernel/yama/ptrace_scope (0 permits tracing your own processes, a \
+        higher value restricts it further) and whether an LSM such as SELinux or \
+        AppArmor is blocking PTRACE for this program.";
+
+    /// Discriminant bytes the child-failure pipe carries. See `fail` and
+    /// `read_child_failure` in the x86_64 implementation for the wire format itself.
+    const WIRE_SETPGID: u8 = 1;
+    const WIRE_CHDIR: u8 = 2;
+    const WIRE_TRACEME: u8 = 3;
+    const WIRE_EXECVE: u8 = 4;
+
+    /// `1` discriminant byte plus `4` bytes of the raw errno, native-endian.
+    const WIRE_LEN: usize = 5;
+
+    /// Reconstruct a `ChildFailure` from the discriminant byte and raw errno the pipe
+    /// carried. `None` for a byte the child could never have sent, which would mean the
+    /// wire format and this function have drifted apart.
+    #[cfg_attr(
+        not(target_arch = "x86_64"),
+        allow(
+            dead_code,
+            reason = "only produced by the x86_64 tracer's failure pipe"
+        )
+    )]
+    fn from_wire(kind: u8, errno: i32) -> Option<Self> {
+        let errno = Errno::from_raw(errno);
+        match kind {
+            Self::WIRE_SETPGID => Some(Self::SetPgid(errno)),
+            Self::WIRE_CHDIR => Some(Self::Chdir(errno)),
+            Self::WIRE_TRACEME => Some(Self::Traceme(errno)),
+            Self::WIRE_EXECVE => Some(Self::Execve(errno)),
+            _ => None,
+        }
+    }
+}
+
+impl std::fmt::Display for ChildFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::SetPgid(errno) => {
+                write!(
+                    f,
+                    "the traced child could not join its own process group: {errno}"
+                )
+            }
+            Self::Chdir(errno) => write!(
+                f,
+                "the traced child could not chdir into its working directory: {errno}"
+            ),
+            Self::Traceme(errno) => write!(f, "ptrace::traceme() was refused: {errno}"),
+            Self::Execve(errno) => {
+                write!(f, "the traced program could not be executed: {errno}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for ChildFailure {}
+
+impl miette::Diagnostic for ChildFailure {
+    fn help(&self) -> Option<Box<dyn std::fmt::Display + '_>> {
+        match self {
+            Self::Traceme(_) => Some(Box::new(Self::PTRACE_DENIED_HELP)),
+            Self::SetPgid(_) | Self::Chdir(_) | Self::Execve(_) => None,
+        }
     }
 }
 
@@ -215,6 +326,20 @@ fn report(
 }
 
 #[cfg(not(target_arch = "x86_64"))]
+/// The diagnostic every non-`x86_64` entry point in this module returns: there is no
+/// syscall table for anything but `x86_64` (see [`trace`]), so neither deriving nor
+/// verifying a profile is possible here. Shared between [`trace`] and [`preflight`] so
+/// the wording cannot drift apart between the two stubs.
+fn unsupported_architecture<T>() -> miette::Result<T> {
+    Err(miette::miette!(
+        help = "run the runtime monitor on an x86_64 host, or extend the syscall table in \
+                src/perms/monitor.rs for this architecture",
+        "the ptrace runtime monitor is implemented for x86_64 only (this is {})",
+        std::env::consts::ARCH
+    ))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
 /// Run `program` with `args` under ptrace and record what it actually touched.
 ///
 /// **Only implemented for `x86_64`.** Syscall numbers and the argument registers are
@@ -231,16 +356,28 @@ pub fn trace(
     options: &TraceOptions,
 ) -> miette::Result<TraceReport> {
     let _ = (program, args, options);
-    Err(miette::miette!(
-        help = "run the runtime monitor on an x86_64 host, or extend the syscall table in \
-                src/perms/monitor.rs for this architecture",
-        "the ptrace runtime monitor is implemented for x86_64 only (this is {})",
-        std::env::consts::ARCH
-    ))
+    unsupported_architecture()
 }
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::trace;
+
+#[cfg(not(target_arch = "x86_64"))]
+/// Whether this host can actually run [`trace`] at all, without running any package.
+///
+/// See the x86_64 implementation for what "actually" means: a probe that never `execve`s
+/// cannot tell "ptrace denied" apart from "ptrace fully permitted", so it has to do more
+/// than call `ptrace::traceme()` and look at the result.
+///
+/// # Errors
+///
+/// Always, on a non-`x86_64` target, for the same reason [`trace`] always errors here.
+pub fn preflight() -> miette::Result<()> {
+    unsupported_architecture()
+}
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::preflight;
 
 /// The x86_64 implementation: syscall table, argument decoding and the tracer loop.
 ///
@@ -250,7 +387,11 @@ mod x86_64 {
     use std::{
         collections::HashMap,
         ffi::{CString, OsString},
-        os::unix::ffi::OsStringExt as _,
+        io::Read as _,
+        os::{
+            fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd, RawFd},
+            unix::ffi::OsStringExt as _,
+        },
         path::{Path, PathBuf},
         sync::{Mutex, PoisonError},
         time::{Duration, Instant},
@@ -269,7 +410,7 @@ mod x86_64 {
     };
     use tracing::{debug, trace as trace_log, warn};
 
-    use super::{Observation, TraceOptions, TraceReport, report};
+    use super::{ChildFailure, Observation, TraceOptions, TraceReport, report};
     use crate::perms::Permission;
 
     /// What a decoded syscall argument turns into.
@@ -625,27 +766,73 @@ mod x86_64 {
             "starting ptrace runtime monitor"
         );
 
-        // SAFETY: the child branch below touches nothing but pre-allocated CStrings and
-        // async-signal-safe syscalls before `execve` replaces the image.
+        // A CLOEXEC pipe is how the child reports *which* of its four failure paths
+        // fired before `execve` - see `fail` and `read_child_failure` below. This is
+        // created before `fork` so both ends already exist when the child branch starts;
+        // creating it after would race the child against its own pipe.
+        let (failure_read, failure_write) = cloexec_pipe()?;
+
+        // SAFETY: the child branch below touches nothing but pre-allocated CStrings, a
+        // raw fd and async-signal-safe syscalls before `execve` replaces the image.
         match unsafe { fork() }
             .into_diagnostic()
             .wrap_err("fork for ptrace monitor")?
         {
             ForkResult::Child => {
-                child(&program_c, &argv, &envp, working_dir.as_deref());
+                // The child never reads from this pipe; keeping its copy around would
+                // only stop the read end's own CLOEXEC from doing anything useful.
+                drop(failure_read);
+                child(
+                    &program_c,
+                    &argv,
+                    &envp,
+                    working_dir.as_deref(),
+                    failure_write.as_raw_fd(),
+                );
             }
-            ForkResult::Parent { child } => supervise(child, program, options),
+            ForkResult::Parent { child } => {
+                // Fork duplicated our copy of the write end, and CLOEXEC only closes it
+                // on an *exec* - which we, the parent, are never going to do. Keeping it
+                // open here would mean the pipe always has a writer, so `supervise`'s
+                // read would block forever waiting for an EOF that never comes.
+                drop(failure_write);
+                supervise(child, program, options, failure_read)
+            }
         }
     }
 
-    /// Serialises [`trace`] calls within one process.
+    /// Create a pipe whose both ends are `O_CLOEXEC`, atomically.
+    ///
+    /// `nix::unistd::pipe2` would need the crate's `fs` feature, which is not on (see the
+    /// module doc), so this calls `libc::pipe2` directly - the same pattern already used
+    /// for `chdir`. Atomicity matters here: a plain `pipe` followed by a separate
+    /// `fcntl(F_SETFD)` leaves a window where a concurrent `exec` elsewhere in this
+    /// process would leak the fd across it.
+    fn cloexec_pipe() -> Result<(OwnedFd, OwnedFd)> {
+        let mut fds = [-1_i32; 2];
+        // SAFETY: `fds` is a valid, correctly sized buffer; `pipe2` either fills both
+        // slots or returns an error and leaves them untouched.
+        let result = unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) };
+        if result != 0 {
+            return Err(Errno::last())
+                .into_diagnostic()
+                .wrap_err("cannot create the child-failure pipe");
+        }
+        // SAFETY: `pipe2` returned success, so both fds are open, valid and not owned
+        // anywhere else yet.
+        Ok(unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) })
+    }
+
+    /// Serialises [`trace`] and [`preflight`] calls within one process.
     ///
     /// `ptrace`'s wait interface is process-wide: the tracer loop calls `waitpid(-1)`,
     /// which reaps *any* child of this process, because a tracee's forked children are
     /// not known by pid until their first stop arrives. Two tracers running side by side
     /// therefore consume each other's syscall stops and each writes a profile built from
     /// half of the other program's behaviour - silently, and with no error anywhere. A
-    /// second caller waits here instead.
+    /// second caller waits here instead. [`preflight`] forks a tracee of its own for the
+    /// same reason: without this lock, a concurrent [`trace`]'s `waitpid(-1)` could reap
+    /// `preflight`'s probe child before `preflight`'s own targeted wait ever sees it.
     ///
     /// This guards only *other tracers*. Any other code in the process that spawns and
     /// reaps its own children concurrently - a `std::process::Command`, a build step -
@@ -653,38 +840,224 @@ mod x86_64 {
     /// child-reaping work in flight.
     static TRACER: Mutex<()> = Mutex::new(());
 
+    /// Whether this host can actually run [`trace`] at all: fork, ask to be traced, exec
+    /// something trivial and confirm the kernel raises the post-exec stop.
+    ///
+    /// A child that only calls `ptrace::traceme()` and then `_exit(0)` proves nothing: it
+    /// produces a plain [`WaitStatus::Exited`], not a stop, **even on a host where ptrace
+    /// is fully permitted**, because there was never a syscall for the kernel to trap.
+    /// Only a completed `execve` raises the `SIGTRAP` that [`trace`] itself depends on
+    /// for its own first wait, so this has to actually exec something - `/bin/true`,
+    /// since shipping a private helper binary just for this check is a later phase's
+    /// job. A [`WaitStatus::Stopped`] here is the proof; anything else means `ptrace` did
+    /// not work end to end, whether because it was denied or for some other reason.
+    ///
+    /// Later phases lean on this without running a package at all: `pm-trace` checks it
+    /// before tracing anything, and the daemon uses it to decide whether to advertise an
+    /// `audit` feature in the first place.
+    ///
+    /// # Errors
+    ///
+    /// A diagnostic if `fork` itself fails, or if the probe child never reached a traced
+    /// stop - most often because `/proc/sys/kernel/yama/ptrace_scope` or an LSM policy
+    /// refused `ptrace::traceme()`, which is why that is the one case with a `help`.
+    pub fn preflight() -> Result<()> {
+        let _tracer = TRACER.lock().unwrap_or_else(PoisonError::into_inner);
+
+        // SAFETY: the child branch touches nothing but `traceme` and `execve`, both
+        // async-signal-safe, before `_exit`.
+        match unsafe { fork() }
+            .into_diagnostic()
+            .wrap_err("fork for the ptrace preflight check")?
+        {
+            ForkResult::Child => {
+                if ptrace::traceme().is_err() {
+                    // SAFETY: `_exit` is async-signal-safe and does not unwind.
+                    unsafe { libc::_exit(1) }
+                }
+                let program = c"/bin/true";
+                let argv = [program];
+                let envp: [&std::ffi::CStr; 0] = [];
+                let _ = execve(program, &argv, &envp);
+                // SAFETY: `_exit` is async-signal-safe and does not unwind.
+                unsafe { libc::_exit(1) }
+            }
+            ForkResult::Parent { child } => {
+                let status = waitpid(child, None)
+                    .into_diagnostic()
+                    .wrap_err("waiting for the ptrace preflight probe")?;
+                match status {
+                    WaitStatus::Stopped(..) => {
+                        // Alive, traced and stopped right after `execve` - ptrace works
+                        // end to end. There is no further use for it; kill and reap it
+                        // the same defensive way `drain` does for a stopped tracee.
+                        let _ = ptrace::kill(child);
+                        let _ = ptrace::cont(child, Signal::SIGKILL);
+                        let _ = waitpid(child, None);
+                        Ok(())
+                    }
+                    // Exited or Signaled are both terminal: the single `waitpid` above
+                    // already reaped the probe, so there is nothing left to clean up.
+                    _ => Err(miette!(
+                        help = ChildFailure::PTRACE_DENIED_HELP,
+                        "ptrace preflight failed: the probe never reached a traced stop \
+                         ({status:?})"
+                    )),
+                }
+            }
+        }
+    }
+
     /// The child half of [`trace`]: become a process group leader, ask to be traced and
-    /// exec. Never returns - every failure path is an `_exit`, because returning would
-    /// leave a duplicate of the tracer running.
+    /// exec. Never returns - every failure path writes to `failure_pipe` and then
+    /// `_exit`s, because returning would leave a duplicate of the tracer running.
     fn child(
         program: &CString,
         argv: &[CString],
         envp: &[CString],
         working_dir: Option<&std::ffi::CStr>,
+        failure_pipe: RawFd,
     ) -> ! {
         // Own process group, so the timeout can kill the whole tree with one killpg.
-        if setpgid(Pid::from_raw(0), Pid::from_raw(0)).is_err() {
-            // SAFETY: `_exit` is async-signal-safe and does not unwind.
-            unsafe { libc::_exit(127) }
+        if let Err(errno) = setpgid(Pid::from_raw(0), Pid::from_raw(0)) {
+            fail(
+                failure_pipe,
+                ChildFailure::WIRE_SETPGID,
+                errno_to_wire(errno),
+            );
         }
         if let Some(dir) = working_dir {
             // SAFETY: `dir` is a live NUL-terminated string; `chdir` is async-signal-safe.
             // `nix::unistd::chdir` would need the crate's `fs` feature, which is not on.
             if unsafe { libc::chdir(dir.as_ptr()) } != 0 {
-                unsafe { libc::_exit(127) }
+                fail(
+                    failure_pipe,
+                    ChildFailure::WIRE_CHDIR,
+                    errno_to_wire(Errno::last()),
+                );
             }
         }
-        if ptrace::traceme().is_err() {
-            unsafe { libc::_exit(127) }
+        if let Err(errno) = ptrace::traceme() {
+            fail(
+                failure_pipe,
+                ChildFailure::WIRE_TRACEME,
+                errno_to_wire(errno),
+            );
         }
-        let _ = execve(program, argv, envp);
-        // execve only returns on failure.
+        match execve(program, argv, envp) {
+            // `execve` has no successful return - the image it names is running instead
+            // of this one - so `Infallible` has no value to match here.
+            Ok(never) => match never {},
+            Err(errno) => fail(
+                failure_pipe,
+                ChildFailure::WIRE_EXECVE,
+                errno_to_wire(errno),
+            ),
+        }
+    }
+
+    /// A future `nix` that changes `Errno`'s size would silently change what
+    /// `errno_to_wire` puts on the wire; this fails the build instead, the moment that
+    /// version is compiled against.
+    const _: () = assert!(size_of::<Errno>() == size_of::<i32>());
+
+    /// The raw errno [`fail`] puts on the wire, as a plain discriminant read rather than
+    /// a bit-reinterpretation - sound only because `nix` declares `Errno` `#[repr(i32)]`,
+    /// which is what keeps this allocation-free and safe to call between `fork` and
+    /// `execve`. Re-check this on a `nix` upgrade; the `const` assertion above catches a
+    /// size change but not a repr change that keeps the same size.
+    fn errno_to_wire(errno: Errno) -> i32 {
+        errno as i32
+    }
+
+    /// Write one discriminant byte and the raw `errno` to the CLOEXEC failure pipe, then
+    /// `_exit(127)`.
+    ///
+    /// This is exactly how `std::process` reports a pre-exec failure back to its parent,
+    /// and for the same reason: `write` is async-signal-safe and `child`'s `-> !` return
+    /// type requires everything on its failure paths to be. The exit code stays 127 on
+    /// every path - a distinct code per failure would collide with a tracee that
+    /// genuinely exits 127 or 126 on its own, and `supervise` would have no way to tell
+    /// a denied `traceme` from a program that just happens to exit 127.
+    fn fail(write_fd: RawFd, kind: u8, errno: i32) -> ! {
+        let mut message = [0_u8; ChildFailure::WIRE_LEN];
+        message[0] = kind;
+        message[1..].copy_from_slice(&errno.to_ne_bytes());
+
+        // SAFETY: `write_fd` is the write end of the pipe `trace` created for this
+        // child and is still open; `BorrowedFd` here does not take ownership or close
+        // it, which matters because this fd must remain valid across the retry loop.
+        let write_fd = unsafe { BorrowedFd::borrow_raw(write_fd) };
+        let mut sent = 0_usize;
+        while sent < message.len() {
+            match nix::unistd::write(write_fd, &message[sent..]) {
+                Ok(0) | Err(_) => break, // best effort: nothing more to do before _exit.
+                Ok(n) => sent += n,
+            }
+        }
+        // SAFETY: `_exit` is async-signal-safe and does not unwind.
         unsafe { libc::_exit(127) }
+    }
+
+    /// Read whatever [`fail`] left in the child-failure pipe, once the tracee has
+    /// already exited.
+    ///
+    /// `Ok(None)` is a clean EOF: nothing was ever written, because a successful
+    /// `execve` closed the write end via `O_CLOEXEC` before the tracee went on to exit
+    /// entirely on its own. Any other outcome - a full wire-format message, or a
+    /// malformed one - is surfaced rather than folded back into "clean", which is the
+    /// one behaviour this whole pipe exists to rule out.
+    fn read_child_failure(read_end: OwnedFd) -> Result<Option<ChildFailure>> {
+        let mut file = std::fs::File::from(read_end);
+        let mut message = [0_u8; ChildFailure::WIRE_LEN];
+        let mut filled = 0_usize;
+        loop {
+            match file.read(&mut message[filled..]) {
+                Ok(0) => break,
+                Ok(n) => filled += n,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => {
+                    return Err(error)
+                        .into_diagnostic()
+                        .wrap_err("reading the child-failure pipe");
+                }
+            }
+            if filled == message.len() {
+                break;
+            }
+        }
+        match filled {
+            0 => Ok(None),
+            n if n == ChildFailure::WIRE_LEN => {
+                let errno = i32::from_ne_bytes([message[1], message[2], message[3], message[4]]);
+                ChildFailure::from_wire(message[0], errno)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        miette!(
+                            "the child-failure pipe named an unknown failure kind {}",
+                            message[0]
+                        )
+                    })
+            }
+            n => Err(miette!(
+                "the child-failure pipe delivered {n} of {} expected bytes",
+                ChildFailure::WIRE_LEN
+            )),
+        }
     }
 
     /// The tracer loop: step every tracee through its syscalls until they all exit or
     /// the timeout fires.
-    fn supervise(root: Pid, program: &Path, options: &TraceOptions) -> Result<TraceReport> {
+    ///
+    /// `failure_read` is the read end of the pipe [`child`] reports a pre-exec failure
+    /// through. It is only ever consulted once, on the very first wait: past that first
+    /// stop the tracee has already exec'd, so there is nothing left for it to say.
+    fn supervise(
+        root: Pid,
+        program: &Path,
+        options: &TraceOptions,
+        failure_read: OwnedFd,
+    ) -> Result<TraceReport> {
         let deadline = Instant::now() + options.timeout;
         let mut observations: Vec<Observation> = Vec::new();
 
@@ -692,8 +1065,20 @@ mod x86_64 {
         // installed the new image. Until it arrives the tracee has no options set.
         match wait_any(deadline)? {
             Wait::Event(WaitStatus::Exited(_, code)) => {
-                warn!(code, "tracee exited before the initial exec trap");
-                return Ok(report(observations, false, Some(code)));
+                // The tracee is dead, so every fd it held is already closed - whatever
+                // is sitting in the pipe now is everything there will ever be. Zero
+                // bytes means a successful `execve` closed the write end via CLOEXEC
+                // before this arrived, i.e. the tracee really did exec and exit on its
+                // own. Anything else means `child` never got that far, and reporting
+                // this as a clean, empty audit would be exactly the bug this pipe
+                // exists to close.
+                return match read_child_failure(failure_read)? {
+                    None => {
+                        warn!(code, "tracee exited before the initial exec trap");
+                        Ok(report(observations, false, Some(code)))
+                    }
+                    Some(failure) => Err(failure.into()),
+                };
             }
             Wait::Event(WaitStatus::Stopped(pid, _)) => set_options(pid, options.follow_forks)?,
             Wait::Event(other) => {

@@ -11,48 +11,19 @@
 //!
 //! The workspace guard tests below need nothing special and always run.
 
-use std::env::{current_dir, set_current_dir};
 use std::fs::{read, read_to_string, remove_dir_all, write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, MutexGuard};
 
-use pm::bf::BuildFile;
+use pm::bf::{BuildFile, BuildOptions};
+use pm::context::BuildContext;
+use pm::progress::Progress;
 use pm::run::PackageRunner;
 use pm::signing::{SigningKey, TrustStore, sign_file};
 use pm::workspace::Workspace;
 use serde::Serialize;
 use serde_yaml::to_string;
 use tempfile::tempdir;
-
-/// `BuildFile::run()` writes into the process-wide current directory; see the
-/// same guard in `tests/packaging.rs`.
-static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-struct CwdGuard {
-    previous: PathBuf,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl CwdGuard {
-    fn enter(to: &Path) -> Self {
-        let lock = CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = current_dir().expect("a current directory");
-        set_current_dir(to).expect("move into the test directory");
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = set_current_dir(&self.previous);
-    }
-}
 
 #[test]
 fn a_workspace_hands_out_a_real_directory() {
@@ -206,15 +177,17 @@ fn package_staging(name: &str, script: &str) -> (tempfile::TempDir, PathBuf) {
     .expect("write the build file");
 
     let build = BuildFile::load_unverified(&build_file).expect("load the build file");
-    let archive = {
-        let _cwd = CwdGuard::enter(work.path());
-        let produced = build.run().expect("the build must succeed");
-        if produced.is_absolute() {
-            produced
-        } else {
-            current_dir().expect("a current directory").join(produced)
-        }
-    };
+    // `output_dir` is pointed at `work` explicitly, rather than moving the
+    // process's current directory there: the whole point of `BuildContext` is
+    // that this test's archive lands in ITS OWN directory even while sibling
+    // tests in this binary run the same build concurrently, each with their
+    // own `work`.
+    let ctx = BuildContext::from_env()
+        .expect("capture the ambient build context")
+        .with_output_dir(work.path().to_path_buf());
+    let archive = build
+        .run_with_progress_in(&ctx, BuildOptions::default(), &Progress::disabled())
+        .expect("the build must succeed");
 
     sign(&archive, work.path());
     (work, archive)

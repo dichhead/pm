@@ -23,7 +23,7 @@ use ring::digest::{Context, SHA256};
 use tracing::{debug, warn};
 use url::Url;
 
-use crate::signing::to_hex;
+use crate::{cancel::Cancel, signing::to_hex};
 
 /// How much of the body is hashed and written per pass.
 ///
@@ -48,9 +48,12 @@ const MAX_REDIRECTS: usize = 10;
 /// large to catch a stalled connection, and any value small enough to catch the
 /// stall aborts legitimate downloads. A stalled fetch is therefore interrupted
 /// by the user, not by a clock that cannot tell the two cases apart.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct Downloader {
     max_redirects: usize,
+    /// Checked between chunks so a caller can stop a download in progress.
+    /// `None`, the default, never stops one - see [`Downloader::with_cancel`].
+    cancel: Option<Cancel>,
 }
 
 impl Default for Downloader {
@@ -60,18 +63,38 @@ impl Default for Downloader {
 }
 
 impl Downloader {
-    /// A downloader with the default redirect budget.
+    /// A downloader with the default redirect budget and no cancellation.
     #[must_use]
     pub fn new() -> Self {
         Self {
             max_redirects: MAX_REDIRECTS,
+            cancel: None,
         }
     }
 
     /// Follow at most `max_redirects` redirects instead of the default.
     #[must_use]
     pub fn with_max_redirects(self, max_redirects: usize) -> Self {
-        Self { max_redirects }
+        Self {
+            max_redirects,
+            ..self
+        }
+    }
+
+    /// Check `cancel` after every chunk written, and stop with a diagnostic
+    /// instead of writing another if it has been tripped.
+    ///
+    /// This is best-effort in exactly the way the rest of [`Cancel`] is: it
+    /// only ever gets a chance to act between two chunks, so it does **not**
+    /// interrupt a read that is already blocked in the underlying socket
+    /// waiting on the network - the "no timeout" reasoning on the module doc
+    /// above stays true regardless of whether a cancel token is attached.
+    #[must_use]
+    pub fn with_cancel(self, cancel: Cancel) -> Self {
+        Self {
+            cancel: Some(cancel),
+            ..self
+        }
     }
 
     /// Download `url` into `dest` and return the lowercase hex SHA-256 of what
@@ -116,7 +139,8 @@ impl Downloader {
         let total = content_length(&response.headers);
         debug!(%url, dest = %dest.display(), ?total, "streaming download");
 
-        Self::stream(response, dest, total, on_progress).inspect_err(|_| discard(dest))
+        self.stream(response, dest, total, on_progress)
+            .inspect_err(|_| discard(dest))
     }
 
     /// As [`Downloader::fetch`], but also check the digest against `expected`
@@ -158,6 +182,7 @@ impl Downloader {
 
     /// Write the body to `dest` while hashing and counting it in the same pass.
     fn stream<F>(
+        &self,
         mut response: ResponseLazy,
         dest: &Path,
         total: Option<u64>,
@@ -197,6 +222,18 @@ impl Downloader {
 
             written += read as u64;
             on_progress(written, total);
+
+            // Checked right after the same `on_progress` call a caller's
+            // progress line already observes, so a cancelled download stops
+            // at a chunk boundary instead of writing another one it will only
+            // have to discard. This cannot interrupt the `read` above once it
+            // is blocked waiting on the network - see `Downloader::with_cancel`.
+            if self.cancel.as_ref().is_some_and(Cancel::is_cancelled) {
+                return Err(miette!(
+                    "download of `{}` was cancelled after {written} bytes",
+                    dest.display()
+                ));
+            }
         }
 
         file.flush()

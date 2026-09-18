@@ -12,13 +12,12 @@
 
 use std::{
     collections::HashMap,
-    env::{current_dir, set_current_dir},
     fs::write,
     io::{BufRead as _, BufReader, Write as _},
     net::{TcpListener, TcpStream},
     path::{Path, PathBuf},
     sync::{
-        Arc, Mutex, MutexGuard,
+        Arc,
         atomic::{AtomicBool, Ordering},
     },
     thread::{JoinHandle, sleep},
@@ -250,35 +249,4 @@ pub fn build_file_yaml(
 pub fn write_build_file(path: PathBuf, yaml: &str) -> PathBuf {
     write(&path, yaml).expect("write the build file");
     path
-}
-
-/// Serialises every current-directory change in this test binary.
-static CWD_LOCK: Mutex<()> = Mutex::new(());
-
-/// Holds the current directory at `to` until it is dropped, then restores it
-/// and releases the lock. Fields drop in declaration order, so the directory is
-/// restored before the next test is allowed to take the lock.
-pub struct CwdGuard {
-    previous: PathBuf,
-    _lock: MutexGuard<'static, ()>,
-}
-
-impl CwdGuard {
-    pub fn enter(to: &Path) -> Self {
-        let lock = CWD_LOCK
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous = current_dir().expect("a current directory");
-        set_current_dir(to).expect("move into the test directory");
-        Self {
-            previous,
-            _lock: lock,
-        }
-    }
-}
-
-impl Drop for CwdGuard {
-    fn drop(&mut self) {
-        let _ = set_current_dir(&self.previous);
-    }
 }

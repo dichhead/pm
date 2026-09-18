@@ -25,16 +25,27 @@
 //! [`Progress::disabled`] renders nothing and still forwards `println`, so
 //! `--verbose`, a piped stdout and a test all take the same path through the
 //! build as a live terminal does. There is no second code path to keep honest.
+//!
+//! # A third mode for a daemon with no terminal
+//!
+//! [`Progress::silent`] is neither of the above: it tracks nodes exactly as a
+//! live region does - [`Task::is_live`] is true, so [`crate::sandbox`]
+//! captures a build's stdout instead of inheriting it - but spawns no ticker
+//! and draws nothing, ever. A daemon has no terminal to redraw and no client
+//! watching every `set_message`, so it polls [`Progress::nodes`] on its own
+//! schedule instead.
 
 use std::{
     io::{self, Write},
     sync::{Arc, Mutex, MutexGuard, Weak},
     thread::{sleep, spawn},
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use dialoguer::console::Term;
 use tracing_subscriber::fmt::MakeWriter;
+
+use crate::wire::types::ProgressNode;
 
 /// Frames of the spinner, advanced once per [`Progress::tick`].
 const FRAMES: [char; 10] = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
@@ -51,6 +62,16 @@ const INDENT: usize = 4;
 
 /// Width assumed when the terminal will not say how wide it is.
 const FALLBACK_WIDTH: usize = 80;
+
+/// Cap applied to a node's label and message text by [`sanitise`].
+///
+/// A build file is untrusted input and its commands' stdout reaches
+/// [`Task::set_message`] verbatim, one line at a time (`sandbox::pump` reads
+/// with `read_until(b'\n')`, so one newline-free line is buffered whole
+/// regardless of length). Rendering used to be the only thing that bounded
+/// it, truncating to terminal width at draw time - putting a node on a wire
+/// deletes that cap along with the terminal, so this is now the real one.
+const MESSAGE_CAP: usize = 512;
 
 /// A live region at the bottom of the terminal.
 ///
@@ -97,6 +118,10 @@ enum Canvas {
         sink: Box<dyn Write + Send>,
         width: usize,
     },
+    /// Nowhere. Every draw primitive is a no-op for this variant, and it
+    /// holds no writer at all, so [`Progress::silent`] cannot write a byte
+    /// even by accident - there is nothing here to write to.
+    Silent,
 }
 
 /// One line of the region.
@@ -106,7 +131,14 @@ struct Node {
     depth: usize,
     label: String,
     detail: Detail,
+    /// When this line was opened, kept only for [`Screen::render_node`]'s
+    /// elapsed-time column. `Instant` has no fixed epoch, so it cannot answer
+    /// "when" for anything outside this process.
     started: Instant,
+    /// The same moment as `started`, in `CLOCK_REALTIME` microseconds, which
+    /// DOES survive a process boundary. This is what [`ProgressNode`] reports;
+    /// `started` above is never sent anywhere.
+    started_usec: u64,
 }
 
 /// What a line says after its label.
@@ -117,6 +149,46 @@ enum Detail {
     Message(String),
     /// A transfer, with the total if the server declared one.
     Bytes { done: u64, total: Option<u64> },
+}
+
+impl Node {
+    /// This node as the wire type a poller reads, sanitised and with the wall
+    /// clock in place of `started`.
+    ///
+    /// Every string is sanitised again here even though [`Task::set_message`]
+    /// already sanitised it at ingest: this is the seam that actually leaves
+    /// the process, so it earns its own guarantee rather than trusting a
+    /// different call site to have kept one.
+    ///
+    /// Ids are shifted by one: internal ids start at 0, but a
+    /// [`ProgressNode`] uses `parent == 0` to mean "no parent", so a real
+    /// node can never be numbered 0 on the wire.
+    fn to_wire(&self) -> ProgressNode {
+        let (kind, text, done, total) = match &self.detail {
+            Detail::Silent => (0, String::new(), 0, 0),
+            Detail::Message(message) => (1, sanitise(message, MESSAGE_CAP), 0, 0),
+            Detail::Bytes { done, total } => (2, String::new(), *done, total.unwrap_or(0)),
+        };
+
+        ProgressNode {
+            id: wire_id(self.id),
+            parent: self.parent.map_or(0, wire_id),
+            depth: u32::try_from(self.depth).unwrap_or(u32::MAX),
+            label: sanitise(&self.label, MESSAGE_CAP),
+            kind,
+            text,
+            done,
+            total,
+            started_usec: self.started_usec,
+        }
+    }
+}
+
+/// Map an internal, 0-based node id to the 1-based id [`ProgressNode`] uses,
+/// so `parent == 0` is free to mean "no parent" without colliding with a
+/// real node's id.
+fn wire_id(id: u64) -> u32 {
+    u32::try_from(id.saturating_add(1)).unwrap_or(u32::MAX)
 }
 
 impl Progress {
@@ -164,6 +236,26 @@ impl Progress {
         }
     }
 
+    /// A region that tracks nodes but draws nothing and spawns no thread.
+    ///
+    /// What a daemon uses. `sandbox.rs` decides whether to capture a build
+    /// command's stdout by asking [`Task::is_live`], and a daemon has no
+    /// terminal to inherit onto instead - the journal is the wrong place for
+    /// a package's raw, unbuffered stdout to land. This gives a daemon a
+    /// [`Progress`] that answers `is_live` truthfully, with a real
+    /// [`Canvas::Silent`] behind it that holds no writer at all - so nothing
+    /// here can draw an escape sequence into a log some other process is
+    /// reading - and no ticker thread that would need to be told to stop.
+    #[must_use]
+    pub fn silent() -> Self {
+        Self {
+            inner: Arc::new(Inner {
+                screen: Mutex::new(Screen::new(Canvas::Silent)),
+                live: true,
+            }),
+        }
+    }
+
     /// Build a drawing region and start the ticker that animates it.
     fn live(canvas: Canvas) -> Self {
         let progress = Self {
@@ -198,6 +290,20 @@ impl Progress {
         }
         let screen = self.lock();
         screen.render()
+    }
+
+    /// A snapshot of the current tree as wire types.
+    ///
+    /// What a caller polls on a schedule of its own choosing instead of
+    /// receiving one event per update - the coalescing [`Progress::silent`]
+    /// exists to provide, in place of the volume `set_bytes` produces on its
+    /// own (once per 64 KiB of a transfer) or `set_message` (once per line of
+    /// a build's output). Works on any region, live or not: an empty tree
+    /// simply produces an empty `Vec`, same as [`Progress::snapshot`].
+    #[must_use]
+    pub fn nodes(&self) -> Vec<ProgressNode> {
+        let screen = self.lock();
+        screen.nodes.iter().map(Node::to_wire).collect()
     }
 
     /// Advance the spinner one frame and redraw.
@@ -348,6 +454,7 @@ impl Screen {
             label,
             detail: Detail::Silent,
             started: Instant::now(),
+            started_usec: now_usec(),
         };
 
         match parent.and_then(|parent| self.end_of_subtree(parent)) {
@@ -395,6 +502,10 @@ impl Screen {
                 .size_checked()
                 .map_or(FALLBACK_WIDTH, |(_, columns)| columns as usize),
             Canvas::Writer { width, .. } => *width,
+            // Nothing ever renders a `Silent` canvas, but `render` still runs
+            // as a pure computation - see `Progress::nodes` and `snapshot` -
+            // so this needs an answer, not a panic.
+            Canvas::Silent => FALLBACK_WIDTH,
         }
     }
 
@@ -455,6 +566,7 @@ impl Screen {
                     write!(sink, "\x1b[1A\x1b[2K").ok();
                 }
             }
+            Canvas::Silent => {}
         }
         self.drawn = 0;
     }
@@ -493,6 +605,10 @@ impl Screen {
             (Canvas::Writer { sink, .. }, false) => {
                 write!(sink, "\x1b[?25h").ok();
             }
+            // A `Silent` canvas has no cursor to hide: this only tracks the
+            // boolean so `Inner::drop`'s unconditional restore has an inert
+            // no-op to call, exactly as it does for an empty live region.
+            (Canvas::Silent, _) => {}
         }
         self.cursor_hidden = hidden;
     }
@@ -507,6 +623,7 @@ impl Screen {
                 writeln!(sink, "{line}").ok();
                 sink.flush().ok();
             }
+            Canvas::Silent => {}
         }
     }
 }
@@ -573,9 +690,15 @@ impl Task {
     }
 
     /// Say what this work is doing now, replacing whatever it said before.
+    ///
+    /// `message` is usually a line of a build's own output, which is
+    /// untrusted input, so it is sanitised on the way in through
+    /// [`sanitise`] - the same cap [`Progress::nodes`] later re-applies at
+    /// the point the node actually leaves the process.
     pub fn set_message(&self, message: impl Into<String>) {
         if let Some(id) = self.id {
-            self.progress.describe(id, Detail::Message(message.into()));
+            let message = sanitise(&message.into(), MESSAGE_CAP);
+            self.progress.describe(id, Detail::Message(message));
         }
     }
 
@@ -672,6 +795,21 @@ impl Drop for LogWriter {
     }
 }
 
+/// The current wall-clock time, in `CLOCK_REALTIME` microseconds.
+///
+/// A monotonic `Instant` cannot cross a process boundary - it has no fixed
+/// epoch, so two processes' clocks agree on nothing. This is what
+/// [`ProgressNode::started_usec`] needs instead. Falls back to `0` rather
+/// than panicking on the one system-clock error `SystemTime` can report - the
+/// clock reading before the Unix epoch - since a wrong timestamp on a
+/// progress line is not worth crashing a build over.
+fn now_usec() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|elapsed| u64::try_from(elapsed.as_micros()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
 /// Render a byte count the way a person reads one.
 fn human_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KiB", "MiB", "GiB", "TiB"];
@@ -719,4 +857,36 @@ fn collapse_control(text: &str) -> String {
         })
         .filter(|c| *c != '\u{fffd}')
         .collect()
+}
+
+/// The single choke point untrusted text passes through before it can reach
+/// a wire type.
+///
+/// A build file is untrusted input, and its commands' stdout reaches these
+/// strings verbatim - a package's own `make` output becomes a progress
+/// message, and a failed step's captured stdout AND stderr become a
+/// [`crate::wire::types::Diagnostic`]. Every wire constructor that carries
+/// build-controlled text MUST pass it through here first: [`Task::set_message`]
+/// does, and so does `From<&miette::Report> for Diagnostic` in
+/// [`crate::wire::error`].
+///
+/// Two things happen, in order: control characters are collapsed by reusing
+/// [`collapse_control`] - the same logic that already protects the terminal
+/// render from a carriage return or an escape sequence - and the result is
+/// truncated to `cap` characters. A truncated result always ends in a
+/// visible `…` so a capped message is never mistaken for one that simply
+/// ended there.
+#[must_use]
+pub fn sanitise(text: &str, cap: usize) -> String {
+    let collapsed = collapse_control(text);
+    if collapsed.chars().count() <= cap {
+        return collapsed;
+    }
+    if cap == 0 {
+        return String::new();
+    }
+
+    let mut truncated: String = collapsed.chars().take(cap - 1).collect();
+    truncated.push('…');
+    truncated
 }

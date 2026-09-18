@@ -14,7 +14,6 @@
 
 use std::{
     collections::HashMap,
-    env::current_dir,
     fs::{copy, create_dir_all, read_to_string, write},
     iter::once,
     num::NonZeroUsize,
@@ -29,13 +28,14 @@ use tracing::{debug, info, warn};
 use walkdir::WalkDir;
 
 use crate::{
+    context::BuildContext,
     graph::Graph,
     metadata::{Metadata, Type},
     perms::{Enforcement, Permissions, elf, source},
     policy::BuildPolicy,
     progress::{Progress, Task},
     sandbox::BuildSandbox,
-    signing::{TrustStore, default_trust_dir, verify_file},
+    signing::{TrustStore, verify_file},
     step::{Stage, Step},
     workspace::Workspace,
 };
@@ -82,6 +82,20 @@ pub struct BuildOptions {
     /// scheduler, and is the honest way to take concurrency out of the picture
     /// when a build misbehaves.
     pub jobs: Option<NonZeroUsize>,
+}
+
+/// The caller's environment, the derived sandbox policy and the run-time
+/// options for one call to [`BuildFile::stage`]/[`BuildFile::sandbox`].
+///
+/// Bundled into one value instead of three parameters: `stage` already takes
+/// `task`, `root`, `dependency_archives` and `archive` in their own right, and
+/// adding `ctx` to that list on top of `policy` and `options` was the
+/// difference between a readable signature and a wall of positional
+/// parameters nothing but the compiler could keep straight.
+struct BuildEnv<'a> {
+    ctx: &'a BuildContext,
+    policy: &'a BuildPolicy,
+    options: BuildOptions,
 }
 
 /// A parsed build file: everything needed to build and package one package.
@@ -145,7 +159,22 @@ impl BuildFile {
     /// does not verify against the file, if `path` cannot be read, or if it
     /// does not contain a valid build file.
     pub fn load(path: &Path) -> miette::Result<Self> {
-        verify_signature(path)?;
+        Self::load_in(&BuildContext::from_env()?, path)
+    }
+
+    /// As [`BuildFile::load`], verifying the signature against `ctx.trust_dir`
+    /// instead of this installation's default trust store.
+    ///
+    /// A daemon loading a build file on a caller's behalf trusts the caller's
+    /// keys, not its own: the default trust store is a property of the
+    /// process, and a signature that checks out against it says nothing about
+    /// what the caller who asked for this build actually trusts.
+    ///
+    /// # Errors
+    ///
+    /// As [`BuildFile::load`].
+    pub fn load_in(ctx: &BuildContext, path: &Path) -> miette::Result<Self> {
+        verify_signature(path, &ctx.trust_dir)?;
         Self::parse(path, Verification::Signed)
     }
 
@@ -217,7 +246,26 @@ impl BuildFile {
         options: BuildOptions,
         progress: &Progress,
     ) -> miette::Result<PathBuf> {
-        Graph::resolve(self, options)?.build(options, progress)
+        self.run_with_progress_in(&BuildContext::from_env()?, options, progress)
+    }
+
+    /// As [`BuildFile::run_with_progress`], with the caller's environment made
+    /// explicit instead of read from the process: `ctx.cwd` is where relative
+    /// dependency paths resolve, `ctx.output_dir` is where the finished
+    /// archive lands, and `ctx.trust_dir`/`ctx.path`/`ctx.home` govern
+    /// signature verification, step resolution and toolchain mounting for
+    /// every package in the graph, not only this one.
+    ///
+    /// # Errors
+    ///
+    /// Everything [`BuildFile::run_with_progress`] returns.
+    pub fn run_with_progress_in(
+        &self,
+        ctx: &BuildContext,
+        options: BuildOptions,
+        progress: &Progress,
+    ) -> miette::Result<PathBuf> {
+        Graph::resolve_in(ctx, self, options)?.build_in(ctx, options, progress)
     }
 
     /// The package name.
@@ -302,6 +350,7 @@ impl BuildFile {
     /// deleting it, so the half-finished tree can still be inspected.
     pub(crate) fn build_alone(
         &self,
+        ctx: &BuildContext,
         options: BuildOptions,
         policy: &BuildPolicy,
         progress: &Progress,
@@ -311,13 +360,20 @@ impl BuildFile {
         task.set_message("building");
         info!("building {} version {}", self.name, self.version_string());
 
-        let mut workspace = Workspace::new(format!("{}-{}", self.name, self.version_string()))?;
+        let mut workspace = Workspace::new_in(
+            ctx.scratch_root.as_deref(),
+            format!("{}-{}", self.name, self.version_string()),
+        )?;
         let archive_name = format!("{}-{}.cpkg", self.name, self.version_string());
         let staged_archive = workspace.path().join(&archive_name);
 
-        if let Err(report) = self.stage(
+        let env = BuildEnv {
+            ctx,
             policy,
             options,
+        };
+        if let Err(report) = self.stage(
+            &env,
             &task,
             workspace.path(),
             dependency_archives,
@@ -328,10 +384,10 @@ impl BuildFile {
             return Err(report);
         }
 
-        let destination = current_dir()
-            .into_diagnostic()
-            .wrap_err("cannot determine the current working directory")?
-            .join(&archive_name);
+        // Every package in the graph lands here, not only the root: a
+        // dependency built along the way is packaged exactly the same way the
+        // top-level request is.
+        let destination = ctx.output_dir.join(&archive_name);
         let archive = workspace.persist(&staged_archive, &destination)?;
         info!("packaged {} at {}", self.name, archive.display());
         Ok(archive)
@@ -345,8 +401,7 @@ impl BuildFile {
     /// third sibling, so packing `pkg` never picks up the archive itself.
     fn stage(
         &self,
-        policy: &BuildPolicy,
-        options: BuildOptions,
+        env: &BuildEnv<'_>,
         task: &Task,
         root: &Path,
         dependency_archives: &[PathBuf],
@@ -372,7 +427,7 @@ impl BuildFile {
             .collect::<miette::Result<Vec<PathBuf>>>()?;
 
         let sandbox = self
-            .sandbox(policy, options, &workdir, &staging, dependency_archives)?
+            .sandbox(env, &workdir, &staging, dependency_archives)?
             .with_progress(task.handle());
         self.execute_steps(&sandbox, &workdir)?;
         task.set_message("packaging");
@@ -406,7 +461,7 @@ impl BuildFile {
         );
         write(
             staging.join("metadata"),
-            metadata_yaml(&metadata, policy.fingerprint())?,
+            metadata_yaml(&metadata, env.policy.fingerprint())?,
         )
         .into_diagnostic()
         .wrap_err("cannot write package metadata")?;
@@ -522,19 +577,18 @@ impl BuildFile {
     /// mounts neither `$HOME` nor the host `/tmp` the workspace lives under.
     fn sandbox(
         &self,
-        policy: &BuildPolicy,
-        options: BuildOptions,
+        env: &BuildEnv<'_>,
         workdir: &Path,
         staging: &Path,
         dependency_archives: &[PathBuf],
     ) -> miette::Result<BuildSandbox> {
-        if options.unsandboxed {
+        if env.options.unsandboxed {
             return Ok(BuildSandbox::unsandboxed(workdir, staging));
         }
 
         let read_only = self.read_only_mounts(dependency_archives);
         let borrowed: Vec<&Path> = read_only.iter().map(PathBuf::as_path).collect();
-        BuildSandbox::new(policy, workdir, staging, &borrowed)
+        BuildSandbox::new_in(env.ctx, env.policy, workdir, staging, &borrowed)
             .wrap_err_with(|| format!("cannot build the sandbox for {}", self.name))
     }
 
@@ -605,9 +659,8 @@ impl BuildFile {
 
 /// Verify the detached signature sitting next to `path` against the trust store
 /// of this installation.
-fn verify_signature(path: &Path) -> miette::Result<()> {
-    let trust_dir = default_trust_dir()?;
-    let trust = TrustStore::load(&trust_dir)?;
+fn verify_signature(path: &Path, trust_dir: &Path) -> miette::Result<()> {
+    let trust = TrustStore::load(trust_dir)?;
     verify_file(path, &trust).wrap_err_with(|| {
         format!(
             "refusing to read the build file {}: its signature did not check out",

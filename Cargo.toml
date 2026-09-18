@@ -11,6 +11,10 @@ harness = false
 name = "entrypoints"
 harness = false
 
+[[bin]]
+name = "pm-trace"
+path = "src/bin/pm-trace.rs"
+
 [dependencies]
 arbitrary = { version = "1.4.2", features = ["derive"] }
 clap = { version = "4.6.6", features = ["derive"] }
@@ -38,6 +42,7 @@ tree-sitter-python = "0.25.0"
 tree-sitter-rust = "0.24.2"
 url = { version = "2.5.8", features = ["serde"] }
 walkdir = "2.5.0"
+zbus = { version = "5.19", default-features = false, features = ["async-io", "blocking-api", "p2p"] }
 
 [dev-dependencies]
 divan = "0.1.21"

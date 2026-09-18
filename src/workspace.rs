@@ -52,10 +52,31 @@ impl Workspace {
     /// Returns a diagnostic if the temporary directory cannot be created, for
     /// example when `TMPDIR` is missing, unwritable or full.
     pub fn new(label: impl Into<String>) -> miette::Result<Self> {
+        Self::new_in(None, label)
+    }
+
+    /// As [`Workspace::new`], created under `root` instead of the system
+    /// temporary directory when `root` is `Some`.
+    ///
+    /// A build run on a caller's behalf may need its workspace to live
+    /// somewhere other than the daemon's own `TMPDIR` - under the caller's own
+    /// scratch space, say, so the finished archive's rename onto
+    /// `ctx.output_dir` stays on one filesystem instead of falling back to a
+    /// cross-device copy. `None` reproduces [`Workspace::new`] exactly.
+    ///
+    /// # Errors
+    ///
+    /// Returns a diagnostic if the temporary directory cannot be created, for
+    /// example when the target directory is missing, unwritable or full.
+    pub fn new_in(root: Option<&Path>, label: impl Into<String>) -> miette::Result<Self> {
         let label = label.into();
-        let dir = TempDir::with_prefix(format!("pm-{label}-"))
-            .into_diagnostic()
-            .wrap_err_with(|| format!("failed to create a staging workspace for `{label}`"))?;
+        let prefix = format!("pm-{label}-");
+        let dir = match root {
+            Some(root) => TempDir::with_prefix_in(&prefix, root),
+            None => TempDir::with_prefix(&prefix),
+        }
+        .into_diagnostic()
+        .wrap_err_with(|| format!("failed to create a staging workspace for `{label}`"))?;
         let root = dir.path().to_path_buf();
         debug!(label = %label, path = %root.display(), "created workspace");
         Ok(Self {

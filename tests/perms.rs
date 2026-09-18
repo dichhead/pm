@@ -1408,6 +1408,65 @@ fn tracing_a_missing_program_is_a_diagnostic() {
     }
 }
 
+/// The precise regression this module exists to close: a program that never even starts
+/// used to come back `Ok` with an empty observation list, which reads exactly like "this
+/// package touches nothing" rather than "the exec never happened". It must now be a named
+/// `ChildFailure::Execve`, not a silently clean audit.
+#[test]
+fn a_missing_program_is_named_as_an_execve_child_failure() {
+    let outcome = monitor::trace(
+        Path::new("/definitely/not/here"),
+        &[],
+        &TraceOptions::default(),
+    );
+
+    let error = outcome
+        .expect_err("a program that never execs must not report a clean, zero-observation audit");
+    let failure = error
+        .downcast_ref::<monitor::ChildFailure>()
+        .unwrap_or_else(|| panic!("expected a ChildFailure, got: {error}"));
+    assert!(
+        matches!(failure, monitor::ChildFailure::Execve(_)),
+        "expected ChildFailure::Execve, got {failure:?}"
+    );
+}
+
+/// The same honesty requirement for the other early failure path: a working directory
+/// that does not exist must not disappear into a clean-looking report either.
+#[test]
+fn a_missing_working_directory_is_named_as_a_chdir_child_failure() {
+    let dir = tempdir().expect("temp dir");
+    let missing_working_dir = dir.path().join("does-not-exist");
+
+    let outcome = monitor::trace(
+        Path::new("/bin/true"),
+        &[],
+        &TraceOptions {
+            working_dir: Some(missing_working_dir),
+            ..TraceOptions::default()
+        },
+    );
+
+    let error = outcome.expect_err("a missing working directory must not report a clean audit");
+    let failure = error
+        .downcast_ref::<monitor::ChildFailure>()
+        .unwrap_or_else(|| panic!("expected a ChildFailure, got: {error}"));
+    assert!(
+        matches!(failure, monitor::ChildFailure::Chdir(_)),
+        "expected ChildFailure::Chdir, got {failure:?}"
+    );
+}
+
+/// `preflight` has to prove ptrace actually *works*, not merely that a child can start -
+/// a probe that only calls `traceme()` and exits would report "denied" even here. This
+/// task's host is documented to permit ptrace, so this must succeed.
+#[test]
+fn preflight_confirms_this_host_can_actually_trace() {
+    let result = monitor::preflight();
+    println!("monitor::preflight() on this host: {result:?}");
+    result.expect("this host is documented to permit ptrace");
+}
+
 // ---------------------------------------------------------------------------
 // The three signals together.
 // ---------------------------------------------------------------------------

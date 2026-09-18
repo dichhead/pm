@@ -6,9 +6,12 @@
 //! starts, disappears when it ends, and takes its children with it when the
 //! work that owned them fails.
 
-use std::sync::{Arc, Mutex};
+use std::{
+    sync::{Arc, Mutex},
+    time::Duration,
+};
 
-use pm::progress::Progress;
+use pm::progress::{Progress, sanitise};
 
 /// Width every test renders against, so assertions are about content rather
 /// than about whichever terminal happens to be running them.
@@ -399,5 +402,155 @@ fn the_cursor_is_hidden_only_while_there_are_lines() {
     assert!(
         sink.written().contains("\x1b[?25h"),
         "the cursor must come back as soon as the region has nothing left to draw"
+    );
+}
+
+#[test]
+fn a_thousand_messages_leave_one_node_capped_at_512_chars() {
+    let sink = Sink::default();
+    let progress = region(&sink);
+    let task = progress.task("zlib-1.3.1");
+
+    for i in 0..1000 {
+        task.set_message(format!("CC file-{i}.o with a fairly long compiler line"));
+    }
+
+    let nodes = progress.nodes();
+    assert_eq!(nodes.len(), 1, "1000 updates to one node must still be one node");
+    assert!(
+        nodes[0].text.chars().count() <= 512,
+        "the stored text must never exceed the wire cap: got {} chars",
+        nodes[0].text.chars().count()
+    );
+}
+
+#[test]
+fn a_message_with_escape_and_carriage_return_comes_back_with_neither() {
+    let sink = Sink::default();
+    let progress = region(&sink);
+    let task = progress.task("zlib-1.3.1");
+
+    task.set_message("progress: 50%\rdone\x1b[2Kmore\r\nstuff");
+
+    let nodes = progress.nodes();
+    assert_eq!(nodes.len(), 1);
+    assert!(
+        !nodes[0].text.contains('\r') && !nodes[0].text.contains('\x1b'),
+        "control characters from untrusted build output must not survive onto the wire: {:?}",
+        nodes[0].text
+    );
+}
+
+#[test]
+fn sanitise_truncates_with_a_visible_marker_and_never_exceeds_the_cap() {
+    let long = "x".repeat(50);
+
+    let result = sanitise(&long, 10);
+
+    assert_eq!(result.chars().count(), 10, "a truncated result stays exactly at the cap");
+    assert!(
+        result.ends_with('…'),
+        "truncation must be visible, not silently indistinguishable from a short message: {result:?}"
+    );
+}
+
+#[test]
+fn sanitise_leaves_short_text_untouched() {
+    assert_eq!(sanitise("CC deflate.o", 512), "CC deflate.o");
+}
+
+#[test]
+fn nodes_reports_the_tree_as_wire_types() {
+    let sink = Sink::default();
+    let progress = region(&sink);
+    let package = progress.task("zlib-1.3.1");
+    let command = package.child("make");
+    command.set_message("CC deflate.o");
+
+    let nodes = progress.nodes();
+    assert_eq!(nodes.len(), 2, "a package and its command are two nodes");
+
+    let root = &nodes[0];
+    assert_eq!(root.label, "zlib-1.3.1");
+    assert_eq!(root.parent, 0, "a top-level node's parent is the 0 sentinel");
+    assert_eq!(root.depth, 0);
+    assert_ne!(root.id, 0, "0 is reserved for \"no parent\", so a real id is never 0");
+    assert!(root.started_usec > 0, "started_usec must be a real wall-clock reading");
+
+    let child = &nodes[1];
+    assert_eq!(child.label, "make");
+    assert_eq!(child.parent, root.id, "the command's parent must be the package's wire id");
+    assert_eq!(child.depth, 1);
+    assert_eq!(child.kind, 1, "kind 1 is Message");
+    assert_eq!(child.text, "CC deflate.o");
+    assert_eq!(child.done, 0);
+    assert_eq!(child.total, 0);
+}
+
+#[test]
+fn a_disabled_region_reports_no_nodes() {
+    let progress = Progress::disabled();
+    let _task = progress.task("zlib-1.3.1");
+
+    assert!(
+        progress.nodes().is_empty(),
+        "a disabled region opens no node in the first place, so there is nothing to report"
+    );
+}
+
+#[test]
+fn silent_mode_is_live_so_a_build_captures_into_it() {
+    let progress = Progress::silent();
+    let task = progress.task("zlib-1.3.1");
+
+    assert!(
+        task.is_live(),
+        "sandbox.rs branches on is_live() to decide whether to capture a build's \
+         stdout instead of inheriting it onto the daemon's own stdout"
+    );
+}
+
+#[test]
+fn silent_mode_tracks_nodes_exactly_like_a_live_region() {
+    let progress = Progress::silent();
+    let package = progress.task("zlib-1.3.1");
+    let command = package.child("make");
+    command.set_message("CC deflate.o");
+    command.set_bytes(1024, Some(2048));
+
+    let nodes = progress.nodes();
+    assert_eq!(nodes.len(), 2, "bookkeeping runs exactly as it does for a live region");
+    assert_eq!(nodes[1].kind, 2, "the latest report replaces the node's detail, as in live mode");
+    assert_eq!(nodes[1].done, 1024);
+    assert_eq!(nodes[1].total, 2048);
+
+    drop(command);
+    assert_eq!(
+        progress.nodes().len(),
+        1,
+        "dropping a task removes its node under silent mode too"
+    );
+}
+
+#[test]
+fn silent_mode_spawns_no_ticker_thread() {
+    let progress = Progress::silent();
+    let _task = progress.task("zlib-1.3.1");
+
+    // The spinner frame only ever advances inside `Progress::tick`, which
+    // only ever runs on its own if a ticker thread is calling it. A live
+    // region's ticker (`the_spinner_advances_when_the_region_ticks`, above)
+    // would move this within one `TICK` (80ms); waiting several times that
+    // long and finding the frame unchanged is direct evidence no such thread
+    // exists for a silent region.
+    let frame_of = |progress: &Progress| progress.snapshot()[0].chars().next();
+
+    let before = frame_of(&progress);
+    std::thread::sleep(Duration::from_millis(320));
+    let after = frame_of(&progress);
+
+    assert_eq!(
+        before, after,
+        "a silent region must spawn no ticker, so its spinner frame never advances on its own"
     );
 }
